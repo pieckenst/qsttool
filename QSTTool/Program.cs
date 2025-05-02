@@ -29,9 +29,10 @@ namespace QSTTool
     public class OleObject
     {
         public string ClassName { get; set; } // Primarily for OLE Objects
-        public byte[] Data { get; set; } // Extracted data (e.g., WMF/EMF/PNG/JPG or raw OLE)
+        public byte[] Data { get; set; } // Extracted data (FULL RAW OLE data or Image data)
+        public byte[] PresentationData { get; set; } // Extracted OLE Presentation Stream (e.g., WMF/EMF), if available
         public OleFileType ExtractedType { get; set; } = OleFileType.Unknown;
-        public string SuggestedFileName { get; set; } // Relative filename for export
+        public string SuggestedFileName { get; set; } // Relative filename for export (often based on PresentationData type)
     }
 
     // Result of parsing RTF, includes text and any extracted OLE objects
@@ -370,7 +371,8 @@ namespace QSTTool
                         Guid = questionGuid,
                         OriginalRtf = questionRtf,
                         // Pass context for filename generation
-                        ParsedText = ParseRtf(questionRtf, $"q{questionIndex}")
+                        ParsedText = ParseRtf(questionRtf, $"q{questionIndex}"),
+                        SourceFileName = Path.GetFileName(filePath) // Store the source filename
                     };
 
                     var answerNodes = questionNode.SelectNodes("Answer");
@@ -905,131 +907,102 @@ namespace QSTTool
         // Analyzes raw OLE data, extracts presentation/package, sets OleObject properties
         private static void AnalyzeAndExtractOleData(byte[] rawOleData, OleObject oleObject, string namePrefix, int index)
         {
-            string baseName = $"{namePrefix}_obj{index}_{oleObject.ClassName ?? "Unknown"}";
-            oleObject.Data = rawOleData; // Default to raw data
+            // --- Stage 1: Initial Setup & Defaults --- 
+            oleObject.Data = rawOleData; // STORE THE FULL RAW OLE DATA FIRST!
+            oleObject.PresentationData = null; // Reset presentation data
             oleObject.ExtractedType = OleFileType.GenericOle; // Default type
-            oleObject.SuggestedFileName = baseName + ".ole";   // Default extension
+            string baseName = $"{namePrefix}_obj{index}_{oleObject.ClassName ?? "Unknown"}";
+            oleObject.SuggestedFileName = baseName + ".ole";   // Default extension, might be overwritten
 
             // Tentatively mark as Equation based on class name early on
             bool isLikelyEquation = oleObject.ClassName?.StartsWith("Equation.", StringComparison.OrdinalIgnoreCase) == true;
             if (isLikelyEquation)
             {
                 oleObject.ExtractedType = OleFileType.Equation;
-                // Keep .ole extension for raw data initially, may change if presentation found
             }
 
             if (rawOleData == null || rawOleData.Length < 8) return; // Need at least header size
 
+            // --- Stage 2: Attempt to Parse Inner CFB structure --- 
+            CompoundFile cfOle = null;
             try
             {
-                // Avoid nested using if cfOle creation fails
-                CompoundFile cfOle = null;
-                try
-                {
-                    // Pass the MemoryStream directly, use Default config
-                    cfOle = new CompoundFile(new MemoryStream(rawOleData), CFSUpdateMode.ReadOnly, CFSConfiguration.Default);
-                }
-                catch (Exception ex)
-                {
-                    // Log the error, but KEEP the Equation type if it was set.
-                    Console.WriteLine($"    -> Warning: Failed to open inner OLE structure as CFB for {oleObject.ClassName}: {ex.Message}. Storing raw data.");
-                    // Function returns here, oleObject retains raw data and potentially Equation type.
-                    return;
-                }
-
-                // If cfOle is null here (shouldn't happen if exception wasn't caught, but defensive check)
-                if (cfOle == null) return;
-
-                using (cfOle) // Now safe to use using
-                {
-                    // 1. Try to get Presentation Stream (WMF/EMF)
-                    var presStream = cfOle.RootStorage.TryGetStream("\\x01OlePres000");
-                    if (presStream != null)
-                    {
-                        var presData = presStream.GetData();
-                        oleObject.Data = presData; // Store presentation data instead of raw
-                        // Basic check for WMF/EMF headers (can be more robust)
-                        if (presData.Length > 20 && presData[0] == 0xD7 && presData[1] == 0xCD && presData[2] == 0xC6 && presData[3] == 0x9A) // WMF Placeable header
-                        {
-                            oleObject.ExtractedType = OleFileType.ImageWmf;
-                            oleObject.SuggestedFileName = baseName + ".wmf";
-                        }
-                        else if (presData.Length > 40 && presData[0] == 0x01 && presData[1] == 0x00 && presData[2] == 0x00 && presData[3] == 0x00) // EMF header start
-                        {
-                            oleObject.ExtractedType = OleFileType.ImageEmf;
-                            oleObject.SuggestedFileName = baseName + ".emf";
-                        }
-                        else
-                        {
-                            // Unknown presentation format, save as .bin?
-                            oleObject.ExtractedType = OleFileType.GenericOle; // Revert to generic if unknown presentation
-                            oleObject.SuggestedFileName = baseName + "_pres.bin";
-                        }
-
-                        // ***Important: Override type back to Equation if classname matches***
-                        // Keep the extracted presentation data and corresponding extension (.wmf/.emf)
-                        if (isLikelyEquation)
-                        {
-                            oleObject.ExtractedType = OleFileType.Equation;
-                        }
-                        Console.WriteLine($"    -> Extracted OLE Presentation stream ({oleObject.ExtractedType}, {presData.Length} bytes) for {oleObject.ClassName} as {oleObject.SuggestedFileName}");
-                        return; // Prioritize presentation stream
-                    }
-
-                    // 2. Try to get Package Stream (might contain original file)
-                    var packageStream = cfOle.RootStorage.TryGetStream("Package");
-                    if (packageStream != null)
-                    {
-                        var packageData = packageStream.GetData();
-                        oleObject.Data = packageData;
-                        // TODO: Could try to detect file type based on magic bytes in packageData
-                        string ext = DetermineExtensionFromPackage(packageData, oleObject.ClassName);
-                        oleObject.ExtractedType = OleFileType.GenericOle; // Mark as generic package for now
-                        oleObject.SuggestedFileName = baseName + ext;
-
-                        // Override type if it's an equation package
-                        if (isLikelyEquation)
-                        {
-                            oleObject.ExtractedType = OleFileType.Equation;
-                            // Keep the guessed package extension
-                        }
-                        Console.WriteLine($"    -> Extracted OLE Package stream ({oleObject.ExtractedType}, {packageData.Length} bytes) for {oleObject.ClassName} as {oleObject.SuggestedFileName}");
-                        return;
-                    }
-
-                    // 3. Add checks for other known streams if necessary (e.g., CONTENTS)
-
-                    // No specific stream found. If it was likely an equation, keep that type.
-                    if (isLikelyEquation)
-                    {
-                        oleObject.ExtractedType = OleFileType.Equation;
-                        oleObject.SuggestedFileName = baseName + ".ole"; // Fallback to raw OLE for equations with no stream
-                    }
-                    else
-                    {
-                        // Revert to GenericOle if not an equation and no stream found
-                        oleObject.ExtractedType = OleFileType.GenericOle;
-                        oleObject.SuggestedFileName = baseName + ".ole";
-                    }
-                    Console.WriteLine($"    -> No specific stream (Presentation/Package) found in OLE for {oleObject.ClassName}. Storing raw OLE data ({oleObject.ExtractedType}).");
-                }
+                // Try to open the raw data as a Compound File
+                cfOle = new CompoundFile(new MemoryStream(rawOleData), CFSUpdateMode.ReadOnly, CFSConfiguration.Default);
             }
             catch (Exception ex)
             {
-                // Log error but fallback to storing raw data
-                Console.WriteLine($"    -> Warning: Error during OLE structure processing for {oleObject.ClassName}: {ex.Message}. Storing raw data.");
-                oleObject.Data = rawOleData;
-                // Preserve Equation type if it was initially identified, otherwise generic.
-                if (isLikelyEquation)
+                // Log the error, but KEEP the Equation type if set. Function returns.
+                Console.WriteLine($"    -> Warning: Failed to open inner OLE structure as CFB for {oleObject.ClassName}: {ex.Message}. Raw OLE data stored.");
+                // oleObject.Data already holds raw data. oleObject.ExtractedType might be Equation or GenericOle.
+                return;
+            }
+
+            // Ensure disposal if CFB was opened
+            using (cfOle)
+            {
+                // --- Stage 3: Extract Streams if CFB Parsing Succeeded --- 
+
+                // 1. Try to get Presentation Stream (WMF/EMF)
+                var presStream = cfOle.RootStorage.TryGetStream("\\x01OlePres000");
+                if (presStream != null)
                 {
-                    oleObject.ExtractedType = OleFileType.Equation;
-                    oleObject.SuggestedFileName = baseName + ".ole"; // Keep .ole for raw fallback
+                    var presData = presStream.GetData();
+                    oleObject.PresentationData = presData; // Store *presentation* data separately
+
+                    // Determine presentation type and update SuggestedFileName (but not ExtractedType yet)
+                    string presExt = ".bin";
+                    OleFileType presType = OleFileType.GenericOle; // Temp type for presentation
+
+                    if (presData.Length > 20 && presData[0] == 0xD7 && presData[1] == 0xCD && presData[2] == 0xC6 && presData[3] == 0x9A) // WMF Placeable header
+                    {
+                        presExt = ".wmf";
+                        presType = OleFileType.ImageWmf;
+                    }
+                    else if (presData.Length > 40 && presData[0] == 0x01 && presData[1] == 0x00 && presData[2] == 0x00 && presData[3] == 0x00) // EMF header start
+                    {
+                        presExt = ".emf";
+                        presType = OleFileType.ImageEmf;
+                    }
+                    oleObject.SuggestedFileName = baseName + presExt;
+
+                    // Keep ExtractedType as Equation if it was likely an equation, otherwise update based on presentation
+                    if (!isLikelyEquation)
+                    {
+                        oleObject.ExtractedType = presType; // Set type based on presentation ONLY if not equation
+                    }
+                    Console.WriteLine($"    -> Extracted OLE Presentation stream ({presType}, {presData.Length} bytes) for {oleObject.ClassName}. Main data remains Raw OLE.");
+                    // Don't return yet, might find Package stream too? Or maybe prioritize presentation?
+                    // For now, let's prioritize presentation and return if found.
+                    return;
                 }
-                else
+
+                // 2. Try to get Package Stream (if Presentation not found)
+                // Note: Package stream might override ExtractedType logic if needed later
+                var packageStream = cfOle.RootStorage.TryGetStream("Package");
+                if (packageStream != null)
                 {
-                    oleObject.ExtractedType = OleFileType.GenericOle;
-                    oleObject.SuggestedFileName = baseName + ".ole";
+                    // Currently, we don't store package data separately if presentation wasn't found.
+                    // We rely on the main oleObject.Data holding the raw OLE.
+                    // Could potentially extract package data here if needed.
+                    string ext = DetermineExtensionFromPackage(packageStream.GetData(), oleObject.ClassName);
+                    // Update suggested name if package found and better than default .ole
+                    if (ext != ".bin")
+                    {
+                        oleObject.SuggestedFileName = baseName + ext;
+                    }
+                    // Keep ExtractedType as Equation if it was likely one.
+                    if (!isLikelyEquation)
+                    {
+                        oleObject.ExtractedType = OleFileType.GenericOle; // Treat extracted package as generic OLE
+                    }
+                    Console.WriteLine($"    -> Found OLE Package stream for {oleObject.ClassName}. Main data remains Raw OLE. Suggested ext: {ext}");
+                    // Don't return, just note it was found. Presentation takes precedence.
                 }
+
+                // 3. Add checks for other known streams if necessary (e.g., CONTENTS, Equation Native)
+
+                Console.WriteLine($"    -> No specific Presentation stream found in OLE for {oleObject.ClassName}. Raw OLE data stored ({oleObject.ExtractedType}).");
             }
         }
 
@@ -1161,6 +1134,7 @@ namespace QSTTool
                 sb.AppendLine("  {");
                 sb.AppendFormat("    \"Guid\": \"{0}\",\n", q.Guid);
                 // Use the ToString() which now includes descriptive placeholders
+                sb.AppendFormat("    \"SourceFileName\": \"{0}\",\n", JsonEscape(q.SourceFileName ?? "Unknown")); // Add SourceFileName
                 sb.AppendFormat("    \"Text\": \"{0}\",\n", JsonEscape(q.ParsedText.ToString()));
                 sb.AppendLine("    \"Answers\": [");
                 for (int j = 0; j < q.Answers.Count; j++)
@@ -1239,6 +1213,7 @@ namespace QSTTool
                 {
                     writer.WriteStartElement("Question");
                     writer.WriteAttributeString("Guid", q.Guid);
+                    writer.WriteAttributeString("SourceFileName", q.SourceFileName ?? "Unknown"); // Add SourceFileName attribute
 
                     writer.WriteStartElement("Text");
                     // Use Original RTF for saving back to QST format by default
@@ -1277,7 +1252,7 @@ namespace QSTTool
             int qNum = 1;
             foreach (var q in questions)
             {
-                sb.AppendLine($"ВОПРОС {qNum++}:");
+                sb.AppendLine($"ВОПРОС {qNum++} (Из файла: {q.SourceFileName ?? "Unknown"}):");
                 sb.AppendLine(q.ParsedText.ToString()); // Uses GetTextWithPlaceholders implicitly
                 sb.AppendLine("ОТВЕТЫ:");
                 int aNum = 1;
@@ -1306,6 +1281,9 @@ namespace QSTTool
             {
                 Console.WriteLine("\n--- Добавление нового вопроса ---");
                 var q = new Question { Guid = Guid.NewGuid().ToString() };
+
+                // Set a placeholder source file name for manually created questions
+                q.SourceFileName = $"Manually Added ({Path.GetFileName(fileName)})";
 
                 Console.Write("Введите текст вопроса (RTF OLE объекты НЕ поддерживаются при создании): ");
                 string questionInput = Console.ReadLine();
@@ -1568,7 +1546,11 @@ namespace QSTTool
             int qNum = 1;
             foreach (var q in questions)
             {
-                rtfBuilder.AppendLine($@"\par\b ВОПРОС {qNum++}:\b0\par"); // Question number bold
+                // Add Question number and source file
+                rtfBuilder.Append($@"\par\b ВОПРОС {qNum++}:\b0");
+                AppendRtfText(rtfBuilder, $" (Из файла: {q.SourceFileName ?? "Unknown"})");
+                rtfBuilder.AppendLine(@"\par");
+
                 AppendRtfText(rtfBuilder, q.ParsedText.Text); // Append question text
                 EmbedRtfObjects(rtfBuilder, q.ParsedText.OleObjects); // Append embedded objects for question
                 rtfBuilder.AppendLine(@"\par\i ОТВЕТЫ:\i0\par"); // Answers header italic
@@ -1655,54 +1637,68 @@ namespace QSTTool
             // Convert binary data to hex string
             string hexData = ByteArrayToHexString(ole.Data);
 
-            switch (ole.ExtractedType)
-            {
-                case OleFileType.ImageWmf:
-                case OleFileType.ImageEmf:
-                case OleFileType.ImagePng:
-                case OleFileType.ImageJpeg:
-                case OleFileType.ImageDib:
-                    rtfBuilder.Append(@"{\pict");
-                    // Add picture type tag
-                    switch (ole.ExtractedType)
-                    {
-                        case OleFileType.ImageWmf: rtfBuilder.Append(@"\wmetafile8"); break; // Use 8 for scalabilty?
-                        case OleFileType.ImageEmf: rtfBuilder.Append(@"\emfblip"); break;
-                        case OleFileType.ImagePng: rtfBuilder.Append(@"\pngblip"); break;
-                        case OleFileType.ImageJpeg: rtfBuilder.Append(@"\jpegblip"); break;
-                        case OleFileType.ImageDib: rtfBuilder.Append(@"\dibitmap0"); break;
-                    }
-                    // Add basic size info (can be refined if image dimensions are known)
-                    rtfBuilder.Append(@"\picwgoal1500\pichgoal1000"); // Example size in twips (1/1440 inch)
-                    rtfBuilder.Append(@"\picscalex100\picscaley100 ");
-                    rtfBuilder.Append(hexData);
-                    rtfBuilder.Append(@"}");
-                    break;
+            // Determine if the extracted *presentation* data is a known image format
+            bool presIsWmf = ole.SuggestedFileName?.EndsWith(".wmf", StringComparison.OrdinalIgnoreCase) ?? false;
+            bool presIsEmf = ole.SuggestedFileName?.EndsWith(".emf", StringComparison.OrdinalIgnoreCase) ?? false;
+            // Add other presentation checks if needed (PNG, JPG unlikely for OLE presentation)
 
-                case OleFileType.Equation: // Treat equations as generic OLE for embedding
-                case OleFileType.GenericOle:
-                case OleFileType.Unknown: // Fallback for Unknown if data exists
-                default:
-                    rtfBuilder.Append(@"{\object");
-                    // Specify object class if known (important for equations)
-                    if (!string.IsNullOrEmpty(ole.ClassName) && ole.ClassName != "Unknown")
-                    {
-                        rtfBuilder.Append($@"\objclass {ole.ClassName}");
-                    }
-                    else
-                    {
-                        rtfBuilder.Append(@"\objclass Package"); // Default fallback class
-                    }
-                    rtfBuilder.Append(@"\objw3000\objh2000"); // Example size in twips
-                    rtfBuilder.Append(@"\objscalex100\objscaley100");
-                    // Embed the actual data
-                    rtfBuilder.Append(@"\objdata ");
-                    rtfBuilder.Append(hexData);
-                    // Optional: Add a \result with a \pict representation if available (more complex)
-                    // Could check if ole.Data looks like WMF/EMF and add it here.
-                    // Example: {\result{\pict\wmetafile8\picwgoal1500\pichgoal1000 HEX_FOR_WMF}}
-                    rtfBuilder.Append(@"}");
-                    break;
+            // Check if the object itself is just a simple image (not an OLE container)
+            bool isSimpleImage = ole.ExtractedType == OleFileType.ImageWmf ||
+                                ole.ExtractedType == OleFileType.ImageEmf ||
+                                ole.ExtractedType == OleFileType.ImagePng ||
+                                ole.ExtractedType == OleFileType.ImageJpeg ||
+                                ole.ExtractedType == OleFileType.ImageDib;
+
+            if (isSimpleImage)
+            {
+                // Object is just image data (e.g., from \pict directly, not \object)
+                rtfBuilder.Append(@"{\pict");
+                // Add picture type tag based on ExtractedType
+                switch (ole.ExtractedType)
+                {
+                    case OleFileType.ImageWmf: rtfBuilder.Append(@"\wmetafile8"); break;
+                    case OleFileType.ImageEmf: rtfBuilder.Append(@"\emfblip"); break;
+                    case OleFileType.ImagePng: rtfBuilder.Append(@"\pngblip"); break;
+                    case OleFileType.ImageJpeg: rtfBuilder.Append(@"\jpegblip"); break;
+                    case OleFileType.ImageDib: rtfBuilder.Append(@"\dibitmap0"); break;
+                    default: rtfBuilder.Append(@"\wmetafile8"); break; // Fallback
+                }
+                // Add basic size info
+                rtfBuilder.Append(@"\picwgoal1500\pichgoal1000");
+                rtfBuilder.Append(@"\picscalex100\picscaley100 ");
+                rtfBuilder.Append(ByteArrayToHexString(ole.Data)); // Use the image data directly
+                rtfBuilder.Append(@"}");
+            }
+            else // Embed as OLE Object (Equation, GenericOle, Unknown)
+            {
+                rtfBuilder.Append(@"{\object");
+                // Specify object class
+                rtfBuilder.Append(@"\objclass ");
+                AppendRtfText(rtfBuilder, ole.ClassName ?? "Package"); // Use Package as fallback class
+
+                rtfBuilder.Append(@"\objw3000\objh2000"); // Example size
+                rtfBuilder.Append(@"\objscalex100\objscaley100");
+
+                // Embed the FULL RAW OLE data
+                rtfBuilder.Append(@"{\objdata "); // Start objdata group
+                rtfBuilder.Append(hexData); // Append hex of ole.Data (raw OLE)
+                rtfBuilder.Append(@"}"); // Close objdata group
+
+                // Embed the Presentation stream inside \result if available
+                if (ole.PresentationData != null && (presIsWmf || presIsEmf))
+                {
+                    rtfBuilder.Append(@"{\result{\pict");
+                    if (presIsWmf) rtfBuilder.Append(@"\wmetafile8");
+                    else if (presIsEmf) rtfBuilder.Append(@"\emfblip");
+                    // Size info for presentation picture
+                    rtfBuilder.Append(@"\picwgoal1500\pichgoal1000");
+                    rtfBuilder.Append(@"\picscalex100\picscaley100 ");
+                    // Hex data of the presentation stream
+                    rtfBuilder.Append(ByteArrayToHexString(ole.PresentationData));
+                    rtfBuilder.Append(@"}}"); // Close \pict and \result groups
+                }
+
+                rtfBuilder.Append(@"}"); // Close \object group
             }
         }
 
@@ -1801,6 +1797,7 @@ namespace QSTTool
             public string OriginalRtf { get; set; }
             public RtfParseResult ParsedText { get; set; }
             public List<Answer> Answers { get; set; } = new List<Answer>();
+            public string SourceFileName { get; set; } // NEW: To store the original file name
         }
 
         // Updated Answer class similar to Question
