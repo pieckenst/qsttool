@@ -841,8 +841,8 @@ namespace QSTTool
                 case "emdash": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('—'); currentState.InternalText.Append('—'); } break; // Unicode U+2014
                 case "endash": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('–'); currentState.InternalText.Append('–'); } break; // Unicode U+2013
                 case "bullet": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('•'); currentState.InternalText.Append('•'); } break; // Unicode U+2022
-                case "lquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('‘'); currentState.InternalText.Append('‘'); } break; // Unicode U+2018
-                case "rquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('’'); currentState.InternalText.Append('’'); } break; // Unicode U+2019
+                case "lquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('\''); currentState.InternalText.Append('\''); } break; // Unicode U+2018
+                case "rquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('\''); currentState.InternalText.Append('\''); } break; // Unicode U+2019
                 case "ldblquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('"'); currentState.InternalText.Append('"'); } break; // Unicode U+201C
                 case "rdblquote": if (!currentState.IsReadingObjectData && !currentState.IsReadingPictureData) { currentState.PendingText.Append('"'); currentState.InternalText.Append('"'); } break; // Unicode U+201D
 
@@ -1449,6 +1449,7 @@ namespace QSTTool
             Console.WriteLine("2 - XML (с исходным RTF, как в .qst)");
             Console.WriteLine("3 - TXT (текст с OLE плейсхолдерами)");
             Console.WriteLine("4 - Regenerated QST (пересобранный .qst файл)");
+            Console.WriteLine("5 - RTF (реконструированный с внедренными объектами)");
             Console.Write("Ваш выбор: ");
             string format = Console.ReadLine();
 
@@ -1519,6 +1520,12 @@ namespace QSTTool
                         SaveQstFile(outputPath, questions, useOriginalRtf: true);
                         Console.WriteLine($"QST файл пересобран в: {outputPath}");
                         break;
+                    case "5": // Reconstructed RTF (New)
+                        outputPath = Path.Combine(baseOutputDir, outputBase + ".rtf");
+                        string rtfContent = SerializeToRtf(questions);
+                        File.WriteAllText(outputPath, rtfContent, Win1251); // Save as Windows-1251
+                        Console.WriteLine($"RTF (реконструированный) экспортирован в: {outputPath}");
+                        break;
                     default:
                         Console.WriteLine("Неверный формат!");
                         // Clean up empty base directory if nothing was exported
@@ -1542,98 +1549,267 @@ namespace QSTTool
                 catch { }
             }
         }
-    }
 
-    // Helper class for StringWriter with specific encoding
-    public sealed class StringWriterWithEncoding : StringWriter
-    {
-        private readonly Encoding encoding;
-
-        public StringWriterWithEncoding(Encoding encoding)
+        // *** NEW: Serialize questions to a reconstructed RTF document ***
+        static string SerializeToRtf(List<Question> questions)
         {
-            this.encoding = encoding ?? throw new ArgumentNullException(nameof(encoding));
+            var rtfBuilder = new StringBuilder();
+
+            // Basic RTF Header with Windows-1251 Codepage and Font Table
+            rtfBuilder.AppendLine(@"{\rtf1\ansi\ansicpg1251\deff0\nouicompat");
+            rtfBuilder.AppendLine(@"{\fonttbl{\f0\fnil\fcharset204 Microsoft Sans Serif;}{\f1\fnil\fcharset204 Times New Roman;}}");
+            // Optional: Color Table (can be added if needed)
+            // {\colortbl ;\red0\green0\blue0;}
+
+            // Document Body
+            rtfBuilder.AppendLine(@"\viewkind4\uc1");
+            rtfBuilder.AppendLine(@"\pard\sa200\sl276\slmult1\f0\fs17"); // Default paragraph format
+
+            int qNum = 1;
+            foreach (var q in questions)
+            {
+                rtfBuilder.AppendLine($@"\par\b ВОПРОС {qNum++}:\b0\par"); // Question number bold
+                AppendRtfText(rtfBuilder, q.ParsedText.Text); // Append question text
+                EmbedRtfObjects(rtfBuilder, q.ParsedText.OleObjects); // Append embedded objects for question
+                rtfBuilder.AppendLine(@"\par\i ОТВЕТЫ:\i0\par"); // Answers header italic
+
+                int aNum = 1;
+                foreach (var a in q.Answers)
+                {
+                    string prefix = $"  {aNum++}) ({(a.IsRight ? "Правильный" : "Неправильный")}): ";
+                    rtfBuilder.Append(@"\pard\sa200\sl276\slmult1 "); // Reset paragraph format for answer
+                    AppendRtfText(rtfBuilder, prefix); // Append answer prefix
+                    AppendRtfText(rtfBuilder, a.ParsedText.Text); // Append answer text
+                    EmbedRtfObjects(rtfBuilder, a.ParsedText.OleObjects); // Append embedded objects for answer
+                    rtfBuilder.AppendLine(@"\par"); // End answer paragraph
+                }
+                rtfBuilder.AppendLine(@"\par----------------------------------------\par"); // Separator
+            }
+
+            rtfBuilder.AppendLine(@"}"); // Close the main RTF group
+            return rtfBuilder.ToString();
         }
 
-        public override Encoding Encoding => encoding;
-    }
-
-    // Internal state for the RTF parser group stack
-    internal class RtfGroupState
-    {
-        public bool IsRoot { get; set; } = false; // Identify the root group
-        public StringBuilder PendingText { get; set; } = new StringBuilder();
-        public StringBuilder InternalText { get; set; } = new StringBuilder(); // Track text within this specific group for objclass etc.
-
-        // OLE Object state
-        public bool IsObject { get; set; } = false;
-        public string ObjectClass { get; set; } = "Unknown";
-        public StringBuilder ObjectDataHex { get; set; } = new StringBuilder();
-        public bool IsReadingObjectData { get; set; } = false;
-
-        // Picture state
-        public bool IsPicture { get; set; } = false;
-        public StringBuilder PictureDataHex { get; set; } = new StringBuilder();
-        public bool IsReadingPictureData { get; set; } = false; // Often true immediately inside \pict
-        public OleFileType DetectedPictureType { get; set; } = OleFileType.Unknown; // Set by \wmetafile, etc.
-
-        public RtfConsumeTarget ConsumeNextTextAs { get; set; } = RtfConsumeTarget.None;
-        public bool NextGroupIsIgnorable { get; set; } = false; // Flag for \*
-
-        // Unicode state
-        public int AsciiFallbackChars { get; set; } = 1; // For \uN
-
-        // Ignore state (for \* groups or \result)
-        public bool IgnoreContent { get; set; } = false;
-        public int IgnoreLevel { get; set; } = 0; // Track nesting level of ignored groups
-
-        // Default constructor for root
-        public RtfGroupState() { }
-
-        // Constructor for nested groups, inheriting state
-        public RtfGroupState(RtfGroupState parent)
+        // *** NEW: Helper to append plain text to RTF, escaping characters and handling encoding ***
+        static void AppendRtfText(StringBuilder rtfBuilder, string plainText)
         {
-            // Inherit flags that persist across nested groups unless explicitly changed
-            IsObject = parent.IsObject;
-            IsPicture = parent.IsPicture;
-            ObjectClass = parent.ObjectClass;
-            AsciiFallbackChars = parent.AsciiFallbackChars;
-            IgnoreContent = parent.IgnoreContent;
-            IgnoreLevel = parent.IgnoreLevel;
-            IsReadingObjectData = parent.IsReadingObjectData; // Inherit reading state? Maybe reset? Let's inherit for now.
-            IsReadingPictureData = parent.IsReadingPictureData; // Inherit reading state? Maybe reset? Let's inherit.
-            DetectedPictureType = parent.DetectedPictureType; // Inherit detected type
+            if (string.IsNullOrEmpty(plainText)) return;
 
-            // Reset specific flags/buffers for the new group
-            PendingText = new StringBuilder();
-            InternalText = new StringBuilder(); // Reset internal text for new group
-            ObjectDataHex = new StringBuilder(); // Reset data buffers for new group
-            PictureDataHex = new StringBuilder();
-            ConsumeNextTextAs = RtfConsumeTarget.None; // Reset consumption target
-            NextGroupIsIgnorable = false; // Reset ignorable flag trigger
+            foreach (char c in plainText)
+            {
+                switch (c)
+                {
+                    case '\\': rtfBuilder.Append(@"\\"); break;
+                    case '{': rtfBuilder.Append(@"\{"); break;
+                    case '}': rtfBuilder.Append(@"\}"); break;
+                    case '\t': rtfBuilder.Append(@"\tab "); break; // Handle tabs
+                    case '\r': break; // Ignore CR
+                    case '\n': rtfBuilder.Append(@"\par "); break; // Treat LF as paragraph break (adjust if needed)
+                    default:
+                        // Check if character needs encoding (outside basic ASCII)
+                        byte[] bytes = Win1251.GetBytes(new[] { c });
+                        if (bytes.Length == 1 && bytes[0] <= 127)
+                        {
+                            // Standard ASCII character
+                            rtfBuilder.Append(c);
+                        }
+                        else
+                        {
+                            // Use Win1251 hex encoding for non-ASCII or multi-byte chars
+                            foreach (byte b in bytes)
+                            {
+                                rtfBuilder.Append($@"\'{b:x2}");
+                            }
+                            // Alternatively, for Unicode chars outside target codepage:
+                            // int unicodeValue = Convert.ToInt32(c);
+                            // rtfBuilder.Append($@"\u{unicodeValue}?"); // Includes fallback char '?'
+                        }
+                        break;
+                }
+            }
         }
-    }
-    internal enum RtfConsumeTarget
-    {
-        None,
-        ObjectClass,
-        // Add other targets if needed (e.g., Font name in fonttbl)
-    }
 
-    // Updated Question class to hold both original RTF and parsed result
-    public class Question
-    {
-        public string Guid { get; set; }
-        public string OriginalRtf { get; set; }
-        public RtfParseResult ParsedText { get; set; }
-        public List<Answer> Answers { get; set; } = new List<Answer>();
-    }
+        // *** NEW: Helper to embed multiple OleObjects into RTF ***
+        static void EmbedRtfObjects(StringBuilder rtfBuilder, List<OleObject> objects)
+        {
+            if (objects == null || objects.Count == 0) return;
 
-    // Updated Answer class similar to Question
-    public class Answer
-    {
-        public string Guid { get; set; }
-        public bool IsRight { get; set; }
-        public string OriginalRtf { get; set; }
-        public RtfParseResult ParsedText { get; set; }
+            foreach (var ole in objects)
+            {
+                rtfBuilder.Append(" "); // Add space before object
+                EmbedSingleRtfObject(rtfBuilder, ole);
+                rtfBuilder.Append(" "); // Add space after object
+            }
+        }
+
+        // *** NEW: Helper to embed a single OleObject into RTF ***
+        static void EmbedSingleRtfObject(StringBuilder rtfBuilder, OleObject ole)
+        {
+            if (ole == null || ole.Data == null || ole.Data.Length == 0)
+            {
+                // Optionally add a placeholder if data is missing
+                AppendRtfText(rtfBuilder, $"[Missing Data: {ole?.SuggestedFileName ?? "Unknown Object"}]");
+                return;
+            }
+
+            // Convert binary data to hex string
+            string hexData = ByteArrayToHexString(ole.Data);
+
+            switch (ole.ExtractedType)
+            {
+                case OleFileType.ImageWmf:
+                case OleFileType.ImageEmf:
+                case OleFileType.ImagePng:
+                case OleFileType.ImageJpeg:
+                case OleFileType.ImageDib:
+                    rtfBuilder.Append(@"{\pict");
+                    // Add picture type tag
+                    switch (ole.ExtractedType)
+                    {
+                        case OleFileType.ImageWmf: rtfBuilder.Append(@"\wmetafile8"); break; // Use 8 for scalabilty?
+                        case OleFileType.ImageEmf: rtfBuilder.Append(@"\emfblip"); break;
+                        case OleFileType.ImagePng: rtfBuilder.Append(@"\pngblip"); break;
+                        case OleFileType.ImageJpeg: rtfBuilder.Append(@"\jpegblip"); break;
+                        case OleFileType.ImageDib: rtfBuilder.Append(@"\dibitmap0"); break;
+                    }
+                    // Add basic size info (can be refined if image dimensions are known)
+                    rtfBuilder.Append(@"\picwgoal1500\pichgoal1000"); // Example size in twips (1/1440 inch)
+                    rtfBuilder.Append(@"\picscalex100\picscaley100 ");
+                    rtfBuilder.Append(hexData);
+                    rtfBuilder.Append(@"}");
+                    break;
+
+                case OleFileType.Equation: // Treat equations as generic OLE for embedding
+                case OleFileType.GenericOle:
+                case OleFileType.Unknown: // Fallback for Unknown if data exists
+                default:
+                    rtfBuilder.Append(@"{\object");
+                    // Specify object class if known (important for equations)
+                    if (!string.IsNullOrEmpty(ole.ClassName) && ole.ClassName != "Unknown")
+                    {
+                        rtfBuilder.Append($@"\objclass {ole.ClassName}");
+                    }
+                    else
+                    {
+                        rtfBuilder.Append(@"\objclass Package"); // Default fallback class
+                    }
+                    rtfBuilder.Append(@"\objw3000\objh2000"); // Example size in twips
+                    rtfBuilder.Append(@"\objscalex100\objscaley100");
+                    // Embed the actual data
+                    rtfBuilder.Append(@"\objdata ");
+                    rtfBuilder.Append(hexData);
+                    // Optional: Add a \result with a \pict representation if available (more complex)
+                    // Could check if ole.Data looks like WMF/EMF and add it here.
+                    // Example: {\result{\pict\wmetafile8\picwgoal1500\pichgoal1000 HEX_FOR_WMF}}
+                    rtfBuilder.Append(@"}");
+                    break;
+            }
+        }
+
+        // *** NEW: Helper to convert byte array to hex string ***
+        private static string ByteArrayToHexString(byte[] bytes)
+        {
+            if (bytes == null) return string.Empty;
+            var sb = new StringBuilder(bytes.Length * 2);
+            foreach (byte b in bytes)
+            {
+                sb.AppendFormat("{0:x2}", b);
+            }
+            return sb.ToString();
+        }
+
+
+        // Helper class for StringWriter with specific encoding
+        public sealed class StringWriterWithEncoding : StringWriter
+        {
+            private readonly Encoding encoding;
+
+            public StringWriterWithEncoding(Encoding encoding)
+            {
+                this.encoding = encoding ?? throw new ArgumentNullException(nameof(encoding));
+            }
+
+            public override Encoding Encoding => encoding;
+        }
+
+        // Internal state for the RTF parser group stack
+        internal class RtfGroupState
+        {
+            public bool IsRoot { get; set; } = false; // Identify the root group
+            public StringBuilder PendingText { get; set; } = new StringBuilder();
+            public StringBuilder InternalText { get; set; } = new StringBuilder(); // Track text within this specific group for objclass etc.
+
+            // OLE Object state
+            public bool IsObject { get; set; } = false;
+            public string ObjectClass { get; set; } = "Unknown";
+            public StringBuilder ObjectDataHex { get; set; } = new StringBuilder();
+            public bool IsReadingObjectData { get; set; } = false;
+
+            // Picture state
+            public bool IsPicture { get; set; } = false;
+            public StringBuilder PictureDataHex { get; set; } = new StringBuilder();
+            public bool IsReadingPictureData { get; set; } = false; // Often true immediately inside \pict
+            public OleFileType DetectedPictureType { get; set; } = OleFileType.Unknown; // Set by \wmetafile, etc.
+
+            public RtfConsumeTarget ConsumeNextTextAs { get; set; } = RtfConsumeTarget.None;
+            public bool NextGroupIsIgnorable { get; set; } = false; // Flag for \*
+
+            // Unicode state
+            public int AsciiFallbackChars { get; set; } = 1; // For \uN
+
+            // Ignore state (for \* groups or \result)
+            public bool IgnoreContent { get; set; } = false;
+            public int IgnoreLevel { get; set; } = 0; // Track nesting level of ignored groups
+
+            // Default constructor for root
+            public RtfGroupState() { }
+
+            // Constructor for nested groups, inheriting state
+            public RtfGroupState(RtfGroupState parent)
+            {
+                // Inherit flags that persist across nested groups unless explicitly changed
+                IsObject = parent.IsObject;
+                IsPicture = parent.IsPicture;
+                ObjectClass = parent.ObjectClass;
+                AsciiFallbackChars = parent.AsciiFallbackChars;
+                IgnoreContent = parent.IgnoreContent;
+                IgnoreLevel = parent.IgnoreLevel;
+                IsReadingObjectData = parent.IsReadingObjectData; // Inherit reading state? Maybe reset? Let's inherit for now.
+                IsReadingPictureData = parent.IsReadingPictureData; // Inherit reading state? Maybe reset? Let's inherit.
+                DetectedPictureType = parent.DetectedPictureType; // Inherit detected type
+
+                // Reset specific flags/buffers for the new group
+                PendingText = new StringBuilder();
+                InternalText = new StringBuilder(); // Reset internal text for new group
+                ObjectDataHex = new StringBuilder(); // Reset data buffers for new group
+                PictureDataHex = new StringBuilder();
+                ConsumeNextTextAs = RtfConsumeTarget.None; // Reset consumption target
+                NextGroupIsIgnorable = false; // Reset ignorable flag trigger
+            }
+        }
+        internal enum RtfConsumeTarget
+        {
+            None,
+            ObjectClass,
+            // Add other targets if needed (e.g., Font name in fonttbl)
+        }
+
+        // Updated Question class to hold both original RTF and parsed result
+        public class Question
+        {
+            public string Guid { get; set; }
+            public string OriginalRtf { get; set; }
+            public RtfParseResult ParsedText { get; set; }
+            public List<Answer> Answers { get; set; } = new List<Answer>();
+        }
+
+        // Updated Answer class similar to Question
+        public class Answer
+        {
+            public string Guid { get; set; }
+            public bool IsRight { get; set; }
+            public string OriginalRtf { get; set; }
+            public RtfParseResult ParsedText { get; set; }
+        }
     }
 }
